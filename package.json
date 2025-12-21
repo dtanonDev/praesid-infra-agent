@@ -1,0 +1,14 @@
+{
+  "name": "praesid-infra-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Praesid Infra Scanner Agent (polling) - TCP/TLS/SSH banner checks",
+  "main": "agent.js",
+  "scripts": {
+    "start": "node agent.js"
+  },
+  "dependencies": {
+    "undici": "^6.19.8"
+  }
+}
