@@ -182,6 +182,87 @@ function tlsHandshake(host, port, timeoutMs) {
   });
 }
 
+function buildSummary(findings, meta = {}) {
+  const now = new Date().toISOString();
+
+  // -----------------
+  // Runtime (tech stack passive)
+  // -----------------
+  const runtime = [];
+
+  const osFinding = findings.find(f =>
+    f.category === "ssh" && f.title?.toLowerCase().includes("ssh banner")
+  );
+  if (osFinding?.evidence?.banner) {
+    runtime.push({
+      label: "OS (estimé)",
+      value: osFinding.evidence.banner,
+      status: "ok",
+    });
+  }
+
+  const tlsFinding = findings.find(f => f.category === "tls" && f.severity === "info");
+  if (tlsFinding?.evidence?.protocol) {
+    runtime.push({
+      label: "TLS",
+      value: tlsFinding.evidence.protocol,
+      status: "ok",
+    });
+  }
+
+  // -----------------
+  // Exposure
+  // -----------------
+  const exposure = [];
+
+  const openPortsFinding = findings.find(f => f.title === "Open ports summary");
+  if (openPortsFinding?.evidence?.openPorts?.length) {
+    exposure.push({
+      label: "Ports ouverts",
+      detail: openPortsFinding.evidence.openPorts.join(", "),
+      status: openPortsFinding.evidence.openPorts.length > 5 ? "warn" : "ok",
+      statusLabel: openPortsFinding.evidence.openPorts.length > 5 ? "À réduire" : "Contrôlé",
+    });
+  }
+
+  const sensitive = findings.filter(f =>
+    f.severity === "high" &&
+    ["ports", "banner"].includes(f.category)
+  );
+
+  if (sensitive.length) {
+    exposure.push({
+      label: "Services sensibles",
+      detail: sensitive.map(s => s.title).join(" • "),
+      status: "warn",
+      statusLabel: "À surveiller",
+    });
+  } else {
+    exposure.push({
+      label: "Services sensibles",
+      detail: "Aucun service critique exposé",
+      status: "ok",
+      statusLabel: "OK",
+    });
+  }
+
+  // -----------------
+  // Backups (v1 = inconnu)
+  // -----------------
+  const backups = {
+    status: "warn",
+    detail: "Impossible à vérifier sans authentification",
+  };
+
+  return {
+    timestamp: now,
+    runtime,
+    exposure,
+    backups,
+  };
+}
+
+
 // -----------------------------
 // Passive checks (15-ish)
 // -----------------------------
@@ -570,8 +651,12 @@ async function main() {
       console.log(`[agent] got job ${job.jobId} profile=${job.profile || "ssh_basic"} target=${job?.target?.address}`);
 
       const result = await runJob(job);
+
+      const summary = buildSummary(result.findings, result.meta);
+      
       const payload = {
         status: result.status,
+        summary,
         findings: result.findings,
         meta: { ...(result.meta || {}), profile: job.profile || "ssh_basic" },
       };
