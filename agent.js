@@ -190,7 +190,7 @@ function buildSummary(findings, meta = {}) {
   // -----------------
   const runtime = [];
 
-  const osFinding = findings.find(f =>
+/*   const osFinding = findings.find(f =>
     f.category === "ssh" && f.title?.toLowerCase().includes("ssh banner")
   );
   if (osFinding?.evidence?.banner) {
@@ -199,7 +199,45 @@ function buildSummary(findings, meta = {}) {
       value: osFinding.evidence.banner,
       status: "ok",
     });
+  } */
+
+  const ssh = findings.find(f =>
+    (f.category === "ssh" || f.category === "connect_test") &&
+    (f.title || "").toLowerCase().includes("ssh")
+  );
+
+  const parsed = parseSshBanner(ssh?.evidence?.banner);
+
+  if (parsed?.opensshVersion) {
+    runtime.push({
+      label: "OpenSSH",
+      value: parsed.opensshVersion,
+      status: "ok",
+    });
+  } else if (ssh?.evidence?.banner) {
+    runtime.push({
+      label: "SSH",
+      value: ssh.evidence.banner,
+      status: "ok",
+    });
   }
+
+  if (parsed?.distroHint) {
+    runtime.push({
+      label: "OS (indice)",
+      value: parsed.distroPackageHint
+        ? `${parsed.distroHint} (package ${parsed.distroPackageHint})`
+        : parsed.distroHint,
+      status: "ok",
+    });
+  } else {
+    runtime.push({
+      label: "OS (indice)",
+      value: "Non déterminable sans authentification",
+      status: "warn",
+    });
+  }
+
 
   const tlsFinding = findings.find(f => f.category === "tls" && f.severity === "info");
   if (tlsFinding?.evidence?.protocol) {
@@ -259,6 +297,40 @@ function buildSummary(findings, meta = {}) {
     runtime,
     exposure,
     backups,
+  };
+}
+
+
+function parseSshBanner(banner) {
+  if (!banner || typeof banner !== "string") return null;
+
+  // Typical: SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.13
+  const m = banner.match(/^SSH-\d+\.\d+-(.+)$/);
+  const tail = m ? m[1] : banner;
+
+  // Try OpenSSH_*
+  const openssh = tail.match(/OpenSSH[_-]([0-9.]+p?\d*)/i);
+  const opensshVersion = openssh?.[1] || null;
+
+  // Distro hints (best effort)
+  const distro =
+    /ubuntu/i.test(tail) ? "Ubuntu" :
+    /debian/i.test(tail) ? "Debian" :
+    /centos/i.test(tail) ? "CentOS" :
+    /fedora/i.test(tail) ? "Fedora" :
+    /alpine/i.test(tail) ? "Alpine" :
+    null;
+
+  // Package suffix after distro name, e.g. "Ubuntu-3ubuntu0.13"
+  let pkg = null;
+  const pkgM = tail.match(/Ubuntu-([0-9][A-Za-z0-9.+~-]*)/i);
+  if (pkgM?.[1]) pkg = pkgM[1];
+
+  return {
+    raw: banner,
+    opensshVersion,
+    distroHint: distro,
+    distroPackageHint: pkg,
   };
 }
 
@@ -653,7 +725,7 @@ async function main() {
       const result = await runJob(job);
 
       const summary = buildSummary(result.findings, result.meta);
-      
+
       const payload = {
         status: result.status,
         summary,
