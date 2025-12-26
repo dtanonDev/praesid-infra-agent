@@ -6,9 +6,12 @@
   "description": "Praesid Infra Scanner Agent (polling) - TCP/TLS/SSH banner checks",
   "main": "agent.js",
   "scripts": {
-    "start": "node agent.js"
+    "start": "node agent.js",
+    "check:api": "node check-api.js",
+    "pm2:start": "pm2 start ecosystem.config.cjs --env production --update-env"
   },
   "dependencies": {
+    "ssh2": "^1.15.0",
     "undici": "^6.19.8"
   }
 }

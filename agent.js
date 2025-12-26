@@ -2,6 +2,8 @@ import { request } from "undici";
 import net from "node:net";
 import tls from "node:tls";
 import dns from "node:dns/promises";
+import { Client as SshClient } from "ssh2";
+import "./load-env.js";
 
 // -----------------------------
 // Config
@@ -14,6 +16,7 @@ const POLL_MS = parseInt(process.env.POLL_MS || "1500", 10);
 const MAX_PORTS = parseInt(process.env.MAX_PORTS || "128", 10);
 const CONNECT_TIMEOUT_MS = parseInt(process.env.CONNECT_TIMEOUT_MS || "1500", 10);
 const OVERALL_TIMEOUT_MS = parseInt(process.env.OVERALL_TIMEOUT_MS || "90000", 10);
+const METRICS_INTERVAL_MS = parseInt(process.env.METRICS_INTERVAL_MS || "60000", 10);
 
 if (!PRAESID_API_BASE || !AGENT_TOKEN) {
   console.error("[agent] Missing PRAESID_API_BASE or AGENT_TOKEN");
@@ -25,6 +28,37 @@ try { new URL(PRAESID_API_BASE); } catch {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const metricsState = {
+  windowStart: Date.now(),
+  processed: 0,
+  success: 0,
+  failure: 0,
+  durationTotal: 0,
+  durationCount: 0,
+};
+const metricsTimer = setInterval(() => flushMetrics(false), METRICS_INTERVAL_MS);
+if (typeof metricsTimer.unref === "function") metricsTimer.unref();
+
+const SSH_DEFAULT_USERNAME = process.env.AGENT_DEFAULT_SSH_USER || "praesid_audit";
+const SSH_COMMAND_TIMEOUT_MS = parseInt(process.env.SSH_COMMAND_TIMEOUT_MS || "5000", 10);
+const SSH_MAX_OUTPUT_BYTES = parseInt(process.env.SSH_MAX_OUTPUT_BYTES || "8000", 10);
+const SSH_ALLOWED_COMMANDS = Object.freeze({
+  uname: { command: "uname -a" },
+  osRelease: { command: "cat /etc/os-release" },
+  packagesDeb: { command: "dpkg -l | head -n 40" },
+  packagesRpm: { command: "rpm -qa | head -n 40" },
+  services: { command: "systemctl list-units --type=service --state=running --no-pager | head -n 25" },
+  passwd: { command: "getent passwd | cut -d: -f1,3,7" },
+  lastlog: { command: "last -n 5" },
+  disks: { command: "df -h --output=source,size,used,avail,pcent,target" },
+  ufw: { command: "ufw status" },
+  iptables: { command: "iptables -L --line-numbers" },
+  sshdConfig: { command: "grep -E '^(PasswordAuthentication|PermitRootLogin|PubkeyAuthentication|ChallengeResponseAuthentication)' /etc/ssh/sshd_config || true" },
+  etcShadowPerm: { command: "ls -l /etc/shadow" },
+  etcPasswdPerm: { command: "ls -l /etc/passwd" },
+  cron: { command: "crontab -l 2>/dev/null || echo 'no crontab for current user'" },
+  openPorts: { command: "ss -tunlp | head -n 40" },
+});
 
 // -----------------------------
 // HTTP helpers
@@ -292,12 +326,29 @@ function buildSummary(findings, meta = {}) {
     detail: "Impossible à vérifier sans authentification",
   };
 
-  return {
+  const summary = {
     timestamp: now,
     runtime,
     exposure,
     backups,
   };
+
+  if (meta.systemInfo || meta.packages || meta.services || meta.diskUsage) {
+    summary.sshAudit = {
+      systemInfo: meta.systemInfo || null,
+      packages: meta.packages || [],
+      services: meta.services || [],
+      users: meta.users || null,
+      disks: meta.diskUsage || [],
+      firewall: meta.firewall || null,
+      sshConfig: meta.sshConfig || null,
+      cron: meta.cron || [],
+      openPorts: meta.openPortsDetailed || [],
+      filePermissions: meta.filePermissions || null,
+    };
+  }
+
+  return summary;
 }
 
 
@@ -590,6 +641,347 @@ async function checkPassiveTechFromHeaders(findings) {
 }
 
 // -----------------------------
+// SSH helpers
+// -----------------------------
+function normalizePrivateKey(raw) {
+  if (!raw) return null;
+  const text = raw.toString().trim();
+  if (text.includes("BEGIN")) return text;
+  try {
+    const decoded = Buffer.from(text, "base64").toString("utf8");
+    return decoded.includes("BEGIN") ? decoded : text;
+  } catch {
+    return text;
+  }
+}
+
+function sanitizeOutput(value, maxBytes = SSH_MAX_OUTPUT_BYTES) {
+  if (!value) return "";
+  const clean = value.replace(/[^\x09\x0A\x0D\x20-\x7E]/g, "");
+  if (Buffer.byteLength(clean, "utf8") <= maxBytes) {
+    return clean.trim();
+  }
+  return clean.slice(0, maxBytes).trim();
+}
+
+function linesFromOutput(value, limit = 50) {
+  return sanitizeOutput(value)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
+function parseOsRelease(output) {
+  const entries = {};
+  linesFromOutput(output, 40).forEach((line) => {
+    const idx = line.indexOf("=");
+    if (idx === -1) return;
+    const key = line.slice(0, idx).replace(/"/g, "").trim();
+    const val = line.slice(idx + 1).replace(/"/g, "").trim();
+    if (key) entries[key] = val;
+  });
+  return entries;
+}
+
+function parseSshConfig(output) {
+  const settings = {};
+  linesFromOutput(output, 40).forEach((line) => {
+    const [key, value] = line.split(/\s+/);
+    if (!key) return;
+    settings[key.trim()] = (value || "").trim().toLowerCase();
+  });
+  return settings;
+}
+
+function parseDiskUsage(output) {
+  const lines = linesFromOutput(output, 40);
+  if (lines.length <= 1) return [];
+  const withoutHeader = lines.slice(1);
+  return withoutHeader.map((line) => {
+    const parts = line.split(/\s+/).filter(Boolean);
+    if (parts.length < 6) return null;
+    const [filesystem, size, used, avail, percent, target] = parts.slice(0, 6);
+    return {
+      filesystem,
+      size,
+      used,
+      avail,
+      percent,
+      target,
+    };
+  }).filter(Boolean);
+}
+
+function connectSshClient(options) {
+  const { host, port, username, privateKey, passphrase } = options;
+  const readyTimeout = Number.parseInt(process.env.SSH_READY_TIMEOUT_MS || "8000", 10);
+  return new Promise((resolve, reject) => {
+    const client = new SshClient();
+    const timer = setTimeout(() => {
+      client.destroy();
+      reject(new Error("ssh_connect_timeout"));
+    }, readyTimeout + 2000);
+    client.on("ready", () => {
+      clearTimeout(timer);
+      resolve(client);
+    });
+    client.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    client.connect({
+      host,
+      port,
+      username,
+      privateKey,
+      passphrase,
+      readyTimeout,
+      keepaliveInterval: 5000,
+      keepaliveCountMax: 2,
+      tryKeyboard: false,
+    });
+  });
+}
+
+function runAllowedCommand(ssh, commandKey, timeoutMs = SSH_COMMAND_TIMEOUT_MS) {
+  const descriptor = SSH_ALLOWED_COMMANDS[commandKey];
+  if (!descriptor) {
+    return Promise.reject(new Error(`Command not allowed: ${commandKey}`));
+  }
+  return new Promise((resolve, reject) => {
+    ssh.exec(descriptor.command, (err, stream) => {
+      if (err) return reject(err);
+      const started = Date.now();
+      let stdout = "";
+      let stderr = "";
+      let resolved = false;
+      const timer = setTimeout(() => {
+        if (resolved) return;
+        resolved = true;
+        try { stream.close(); } catch {}
+        reject(new Error("command_timeout"));
+      }, timeoutMs);
+      const finish = (error, exitCode) => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timer);
+        if (error) return reject(error);
+        resolve({
+          stdout: sanitizeOutput(stdout, descriptor.maxBytes || SSH_MAX_OUTPUT_BYTES),
+          stderr: sanitizeOutput(stderr, descriptor.maxBytes || Math.floor(SSH_MAX_OUTPUT_BYTES / 2)),
+          exitCode,
+          tookMs: Date.now() - started,
+        });
+      };
+      stream.on("data", (chunk) => {
+        stdout += chunk.toString("utf8");
+        if (Buffer.byteLength(stdout, "utf8") > (descriptor.maxBytes || SSH_MAX_OUTPUT_BYTES)) {
+          stdout = stdout.slice(0, descriptor.maxBytes || SSH_MAX_OUTPUT_BYTES);
+        }
+      });
+      stream.stderr.on("data", (chunk) => {
+        stderr += chunk.toString("utf8");
+      });
+      stream.on("close", (code) => finish(null, code));
+      stream.on("error", (streamErr) => finish(streamErr));
+    });
+  });
+}
+
+async function runSshAudit(job) {
+  const started = Date.now();
+  const target = job.target || {};
+  const credentials = job.credentials || {};
+  const host = target.address || credentials.host || credentials.hostname;
+  const port = Number.parseInt(credentials.port || target.port || "22", 10);
+  const username = credentials.username || target.username || SSH_DEFAULT_USERNAME;
+  const privateKey = normalizePrivateKey(credentials.privateKey || credentials.key || process.env.AGENT_SSH_KEY);
+  const passphrase = credentials.passphrase ? String(credentials.passphrase) : undefined;
+
+  if (!host || !privateKey) {
+    return {
+      status: "failed",
+      findings: [
+        finding("ssh_auth", "high", "Identifiants SSH manquants", { host, username }, "Fournissez un hôte et une clé privée pour l’audit SSH."),
+      ],
+      meta: { durationMs: 0, error: "missing_credentials" },
+    };
+  }
+
+  let ssh;
+  try {
+    ssh = await connectSshClient({ host, port, username, privateKey, passphrase });
+  } catch (error) {
+    return {
+      status: "failed",
+      findings: [
+        finding("ssh_auth", "high", "Connexion SSH impossible", { host, port, username, error: error.message },
+          "Vérifiez la clé privée, l’utilisateur et l’accessibilité SSH (port 22)."),
+      ],
+      meta: { durationMs: Date.now() - started, error: error.message || "ssh_connect_error" },
+    };
+  }
+
+  const findings = [];
+  const meta = {};
+
+  try {
+    const osRelease = await runAllowedCommand(ssh, "osRelease").catch(() => ({ stdout: "" }));
+    const kernel = await runAllowedCommand(ssh, "uname").catch(() => ({ stdout: "" }));
+    const packagesDeb = await runAllowedCommand(ssh, "packagesDeb").catch(() => ({ stdout: "" }));
+    const packagesRpm = await runAllowedCommand(ssh, "packagesRpm").catch(() => ({ stdout: "" }));
+    const services = await runAllowedCommand(ssh, "services").catch(() => ({ stdout: "" }));
+    const passwd = await runAllowedCommand(ssh, "passwd").catch(() => ({ stdout: "" }));
+    const lastlog = await runAllowedCommand(ssh, "lastlog").catch(() => ({ stdout: "" }));
+    const disksRaw = await runAllowedCommand(ssh, "disks").catch(() => ({ stdout: "" }));
+    const ufw = await runAllowedCommand(ssh, "ufw").catch(() => ({ stdout: "" }));
+    const iptables = await runAllowedCommand(ssh, "iptables").catch(() => ({ stdout: "" }));
+    const sshdConfig = await runAllowedCommand(ssh, "sshdConfig").catch(() => ({ stdout: "" }));
+    const shadowPerm = await runAllowedCommand(ssh, "etcShadowPerm").catch(() => ({ stdout: "" }));
+    const passwdPerm = await runAllowedCommand(ssh, "etcPasswdPerm").catch(() => ({ stdout: "" }));
+    const cron = await runAllowedCommand(ssh, "cron").catch(() => ({ stdout: "" }));
+    const openPorts = await runAllowedCommand(ssh, "openPorts").catch(() => ({ stdout: "" }));
+
+    meta.systemInfo = {
+      kernel: sanitizeOutput(kernel.stdout),
+      osRelease: parseOsRelease(osRelease.stdout),
+    };
+    meta.packages = packagesDeb.stdout ? linesFromOutput(packagesDeb.stdout, 40) : linesFromOutput(packagesRpm.stdout, 40);
+    meta.services = linesFromOutput(services.stdout, 25);
+    meta.users = {
+      accounts: linesFromOutput(passwd.stdout, 40),
+      lastLogins: linesFromOutput(lastlog.stdout, 10),
+    };
+    meta.diskUsage = parseDiskUsage(disksRaw.stdout);
+    meta.firewall = {
+      ufw: sanitizeOutput(ufw.stdout),
+      iptables: linesFromOutput(iptables.stdout, 40),
+    };
+    meta.filePermissions = {
+      shadow: sanitizeOutput(shadowPerm.stdout),
+      passwd: sanitizeOutput(passwdPerm.stdout),
+    };
+    meta.cron = linesFromOutput(cron.stdout, 20);
+    meta.openPortsDetailed = linesFromOutput(openPorts.stdout, 40);
+    meta.sshConfig = parseSshConfig(sshdConfig.stdout);
+
+    // Findings
+    findings.push(finding("ssh_audit", "info", "Audit SSH complété", { host, username }, "Vérifiez les résultats détaillés."));
+
+    if (meta.firewall.ufw.toLowerCase().includes("inactive")) {
+      findings.push(finding("firewall", "medium", "Pare-feu UFW inactif", { ufw: meta.firewall.ufw }, "Activez UFW ou équivalent et restreignez les accès."));
+    }
+
+    const sshConfig = meta.sshConfig || {};
+    if (sshConfig.PasswordAuthentication === "yes") {
+      findings.push(finding("ssh_config", "high", "PasswordAuthentication activé", {}, "Désactivez les mots de passe, n’autorisez que les clés."));
+    }
+    if (sshConfig.PermitRootLogin === "yes") {
+      findings.push(finding("ssh_config", "high", "PermitRootLogin autorisé", {}, "Désactivez l’accès direct root via SSH."));
+    }
+    if (sshConfig.PubkeyAuthentication === "no") {
+      findings.push(finding("ssh_config", "medium", "PubkeyAuthentication désactivé", {}, "Activez l’authentification par clé publique."));
+    }
+
+    const disksWarn = (meta.diskUsage || []).filter((disk) => {
+      const pct = parseInt(String(disk.percent || "").replace("%", ""), 10);
+      return Number.isFinite(pct) && pct >= 90;
+    });
+    if (disksWarn.length) {
+      findings.push(
+        finding("disk", "medium", "Espace disque critique", { disks: disksWarn }, "Libérez de l’espace ou étendez le volume (>90%).")
+      );
+    }
+
+    const shadowPermText = meta.filePermissions.shadow || "";
+    if (shadowPermText && !shadowPermText.startsWith("-rw-------")) {
+      findings.push(
+        finding("permissions", "high", "/etc/shadow permissions non conformes", { shadowPerm: shadowPermText },
+          "Restreignez /etc/shadow à 600 et root:shadow.")
+      );
+    }
+
+    if (!meta.cron.length) {
+      findings.push(finding("cron", "info", "Aucun cron pour l’utilisateur courant", {}, "Ajoutez des tâches planifiées si nécessaire."));
+    }
+
+    if (meta.openPortsDetailed.length) {
+      findings.push(
+        finding("ports", "info", "Ports ouverts (ss -tunlp)", { ports: meta.openPortsDetailed.slice(0, 20) },
+          "Vérifiez que seuls les services nécessaires sont exposés.")
+      );
+    }
+
+    return {
+      status: "completed",
+      findings,
+      meta: {
+        ...meta,
+        durationMs: Date.now() - started,
+        host,
+        username,
+      },
+    };
+  } catch (error) {
+    return {
+      status: "failed",
+      findings: [
+        finding("ssh_audit", "high", "Erreur lors de l’audit SSH", { host, error: error.message },
+          "Revoyez la configuration SSH ou contactez le support Praesid."),
+      ],
+      meta: { ...meta, durationMs: Date.now() - started, error: error.message || "ssh_audit_error" },
+    };
+  } finally {
+    try { ssh.end(); } catch {}
+  }
+}
+
+async function runSshConnectivityTest(job) {
+  const started = Date.now();
+  const target = job.target || {};
+  const credentials = job.credentials || {};
+  const host = target.address || credentials.host || credentials.hostname;
+  const port = Number.parseInt(credentials.port || target.port || "22", 10);
+  const username = credentials.username || target.username || SSH_DEFAULT_USERNAME;
+  const privateKey = normalizePrivateKey(credentials.privateKey || credentials.key || process.env.AGENT_SSH_KEY);
+  const passphrase = credentials.passphrase ? String(credentials.passphrase) : undefined;
+
+  if (!host || !privateKey) {
+    return {
+      status: "failed",
+      findings: [
+        finding("ssh_test", "high", "Informations SSH incomplètes", { host, username },
+          "Fournissez l'hôte, l'utilisateur et la clé privée pour tester la connexion SSH."),
+      ],
+      meta: { durationMs: 0, error: "missing_credentials" },
+    };
+  }
+
+  try {
+    const ssh = await connectSshClient({ host, port, username, privateKey, passphrase });
+    try { ssh.end(); } catch {}
+    return {
+      status: "completed",
+      findings: [
+        finding("ssh_test", "info", "Connexion SSH établie", { host, port, username },
+          "La connexion SSH fonctionne avec ces identifiants."),
+      ],
+      meta: { durationMs: Date.now() - started },
+    };
+  } catch (error) {
+    return {
+      status: "failed",
+      findings: [
+        finding("ssh_test", "high", "Connexion SSH impossible", { host, port, username, error: error.message },
+          "Vérifiez l’utilisateur, la clé privée et l’accès réseau au port SSH."),
+      ],
+      meta: { durationMs: Date.now() - started, error: error.message || "ssh_test_error" },
+    };
+  }
+}
+
+// -----------------------------
 // Profiles
 // -----------------------------
 async function runConnectTest(job) {
@@ -675,9 +1067,110 @@ async function runJob(job) {
   const profile = job?.profile || "ssh_basic";
 
   if (profile === "connect_test") return await runConnectTest(job);
+  if (profile === "ssh_test") return await runSshConnectivityTest(job);
+  if (profile === "ssh_audit") return await runSshAudit(job);
 
   // Default profile: "ssh_basic" -> we interpret as passive full (v1+)
   return await runPassiveFull(job);
+}
+
+function recordJobMetrics(status, durationMs = 0) {
+  metricsState.processed += 1;
+  if (status === "completed") {
+    metricsState.success += 1;
+  } else {
+    metricsState.failure += 1;
+  }
+  if (Number.isFinite(durationMs) && durationMs > 0) {
+    metricsState.durationTotal += durationMs;
+    metricsState.durationCount += 1;
+  }
+}
+
+function flushMetrics(force = false) {
+  const now = Date.now();
+  const elapsed = now - metricsState.windowStart;
+  if (!force && elapsed < METRICS_INTERVAL_MS) return;
+  const processed = metricsState.processed;
+  if (processed === 0 && !force) {
+    metricsState.windowStart = now;
+    return;
+  }
+  const jobsPerHour = processed ? (processed * 3600000) / Math.max(elapsed, 1) : 0;
+  const successRate = processed ? (metricsState.success / processed) * 100 : 0;
+  const avgDuration = metricsState.durationCount
+    ? metricsState.durationTotal / metricsState.durationCount
+    : 0;
+  console.log(
+    `[metrics] window=${Math.round(elapsed / 1000)}s processed=${processed} success=${successRate.toFixed(
+      1
+    )}% jobs/hour=${jobsPerHour.toFixed(2)} avg=${Math.round(avgDuration)}ms`
+  );
+  metricsState.windowStart = now;
+  metricsState.processed = 0;
+  metricsState.success = 0;
+  metricsState.failure = 0;
+  metricsState.durationTotal = 0;
+  metricsState.durationCount = 0;
+}
+
+function installSignalHandlers() {
+  const graceful = (signal) => {
+    console.log(`[agent] received ${signal}, flushing metrics before exit...`);
+    try {
+      flushMetrics(true);
+    } catch (error) {
+      console.warn("[agent] metrics flush error:", error?.message || error);
+    }
+    process.exit(0);
+  };
+  process.on("SIGINT", graceful);
+  process.on("SIGTERM", graceful);
+  process.on("beforeExit", () => flushMetrics(true));
+}
+
+installSignalHandlers();
+
+// -----------------------------
+// Auto-recovery with health checks
+// -----------------------------
+let errorCount = 0;
+const MAX_CONSECUTIVE_ERRORS = 5;
+const HEALTH_CHECK_COOLDOWN = 60000; // 1 minute
+
+async function checkAgentHealth() {
+  try {
+    const response = await apiGet("/agent/health");
+    const text = await response.body.text();
+
+    if (response.statusCode !== 200) {
+      console.error(`[agent] Health check failed: ${response.statusCode} ${text}`);
+      return false;
+    }
+
+    const body = JSON.parse(text);
+    console.log("[agent] Health check:", JSON.stringify(body, null, 2));
+
+    if (body?.ok && body?.agent) {
+      const { status, activeJobs, recentJobs24h } = body.agent;
+      console.log(`[agent] Status: ${status}, Active: ${activeJobs}, Recent 24h: ${recentJobs24h}`);
+
+      if (status === 'healthy') {
+        errorCount = 0; // Reset error count if backend says we're healthy
+        return true;
+      } else if (status === 'degraded') {
+        console.warn("[agent] Status degraded - too many active jobs");
+        return true; // Continue but with warning
+      } else {
+        console.error("[agent] Status down - no recent activity");
+        return false;
+      }
+    }
+    return false;
+  } catch (healthError) {
+    console.error("[agent] Health check failed:", healthError?.message || healthError);
+    return false;
+  }
 }
 
 // -----------------------------
@@ -700,6 +1193,7 @@ async function main() {
 
       if (res.statusCode !== 200) {
         console.error(`[agent] next job error ${res.statusCode}: ${text}`);
+        errorCount++;
         await sleep(Math.min(POLL_MS * 2, 5000));
         continue;
       }
@@ -709,6 +1203,7 @@ async function main() {
         job = JSON.parse(text);
       } catch {
         console.error(`[agent] invalid JSON from /next: ${text}`);
+        errorCount++;
         await sleep(Math.min(POLL_MS * 2, 5000));
         continue;
       }
@@ -716,6 +1211,7 @@ async function main() {
       // Defensive checks
       if (!job || typeof job !== "object" || !job.jobId) {
         console.error(`[agent] /next returned invalid job payload: ${text}`);
+        errorCount++;
         await sleep(Math.min(POLL_MS * 2, 5000));
         continue;
       }
@@ -732,18 +1228,38 @@ async function main() {
         findings: result.findings,
         meta: { ...(result.meta || {}), profile: job.profile || "ssh_basic" },
       };
+      recordJobMetrics(result.status, result.meta?.durationMs);
 
       const post = await apiPost(`/infra-scans/${job.jobId}/results`, payload);
       const postText = await post.body.text();
 
       if (post.statusCode >= 200 && post.statusCode < 300) {
         console.log(`[agent] job ${job.jobId} reported (${result.status})`);
+        errorCount = 0; // Reset on success
       } else {
         console.error(`[agent] report failed ${post.statusCode}: ${postText}`);
+        errorCount++;
       }
     } catch (err) {
       console.error("[agent] loop error:", err?.stack || err);
-      await sleep(Math.min(POLL_MS * 2, 5000));
+      errorCount++;
+
+      // Auto-recovery: After N consecutive errors, run health check
+      if (errorCount >= MAX_CONSECUTIVE_ERRORS) {
+        console.error(`[agent] ${MAX_CONSECUTIVE_ERRORS} consecutive errors detected, running health check...`);
+
+        const isHealthy = await checkAgentHealth();
+
+        if (!isHealthy) {
+          console.error("[agent] Health check failed, waiting before retry...");
+          await sleep(HEALTH_CHECK_COOLDOWN);
+        }
+
+        // Reset error count after health check attempt
+        errorCount = Math.max(0, errorCount - 2); // Reduce but don't fully reset
+      } else {
+        await sleep(Math.min(POLL_MS * 2, 5000));
+      }
     }
   }
 }
