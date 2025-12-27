@@ -947,6 +947,8 @@ async function runSshConnectivityTest(job) {
   const privateKey = normalizePrivateKey(credentials.privateKey || credentials.key || process.env.AGENT_SSH_KEY);
   const passphrase = credentials.passphrase ? String(credentials.passphrase) : undefined;
 
+  console.log("[agent][debug] ssh_test privateKey snippet:", privateKey ? `${privateKey.slice(0, 64)}...` : "missing");
+
   if (!host || !privateKey) {
     return {
       status: "failed",
