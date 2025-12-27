@@ -749,6 +749,7 @@ function runAllowedCommand(ssh, commandKey, timeoutMs = SSH_COMMAND_TIMEOUT_MS) 
   if (!descriptor) {
     return Promise.reject(new Error(`Command not allowed: ${commandKey}`));
   }
+  console.log(`[agent][debug] ssh exec -> ${commandKey}: ${descriptor.command}`);
   return new Promise((resolve, reject) => {
     ssh.exec(descriptor.command, (err, stream) => {
       if (err) return reject(err);
