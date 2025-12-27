@@ -127,7 +127,7 @@ function tcpConnect(host, port, timeoutMs) {
     const socket = net.createConnection({ host, port });
 
     const done = (status, extra = {}) => {
-      try { socket.destroy(); } catch {}
+      try { socket.destroy(); } catch { }
       resolve({
         status,
         host,
@@ -151,7 +151,7 @@ function readLineBanner(host, port, timeoutMs, writeFirst = null) {
     let buf = "";
 
     const done = (status, extra = {}) => {
-      try { socket.destroy(); } catch {}
+      try { socket.destroy(); } catch { }
       resolve({ status, host, port, rttMs: Date.now() - started, ...extra });
     };
 
@@ -159,7 +159,7 @@ function readLineBanner(host, port, timeoutMs, writeFirst = null) {
 
     socket.on("connect", () => {
       if (writeFirst) {
-        try { socket.write(writeFirst); } catch {}
+        try { socket.write(writeFirst); } catch { }
       }
     });
 
@@ -190,7 +190,7 @@ function tlsHandshake(host, port, timeoutMs) {
     });
 
     const done = (status, extra = {}) => {
-      try { socket.destroy(); } catch {}
+      try { socket.destroy(); } catch { }
       resolve({ status, host, port, rttMs: Date.now() - started, ...extra });
     };
 
@@ -224,16 +224,16 @@ function buildSummary(findings, meta = {}) {
   // -----------------
   const runtime = [];
 
-/*   const osFinding = findings.find(f =>
-    f.category === "ssh" && f.title?.toLowerCase().includes("ssh banner")
-  );
-  if (osFinding?.evidence?.banner) {
-    runtime.push({
-      label: "OS (estimé)",
-      value: osFinding.evidence.banner,
-      status: "ok",
-    });
-  } */
+  /*   const osFinding = findings.find(f =>
+      f.category === "ssh" && f.title?.toLowerCase().includes("ssh banner")
+    );
+    if (osFinding?.evidence?.banner) {
+      runtime.push({
+        label: "OS (estimé)",
+        value: osFinding.evidence.banner,
+        status: "ok",
+      });
+    } */
 
   const ssh = findings.find(f =>
     (f.category === "ssh" || f.category === "connect_test") &&
@@ -366,11 +366,11 @@ function parseSshBanner(banner) {
   // Distro hints (best effort)
   const distro =
     /ubuntu/i.test(tail) ? "Ubuntu" :
-    /debian/i.test(tail) ? "Debian" :
-    /centos/i.test(tail) ? "CentOS" :
-    /fedora/i.test(tail) ? "Fedora" :
-    /alpine/i.test(tail) ? "Alpine" :
-    null;
+      /debian/i.test(tail) ? "Debian" :
+        /centos/i.test(tail) ? "CentOS" :
+          /fedora/i.test(tail) ? "Fedora" :
+            /alpine/i.test(tail) ? "Alpine" :
+              null;
 
   // Package suffix after distro name, e.g. "Ubuntu-3ubuntu0.13"
   let pkg = null;
@@ -597,7 +597,7 @@ async function checkHttp(address, openPorts, findings) {
                 "Ensure PUT/DELETE are protected by auth and not exposed publicly."));
             }
           }
-        } catch {}
+        } catch { }
 
         // 4) passive tech from HTML meta (best-effort)
         const ctype = pickHeader(headers, "content-type") || "";
@@ -760,7 +760,7 @@ function runAllowedCommand(ssh, commandKey, timeoutMs = SSH_COMMAND_TIMEOUT_MS) 
       const timer = setTimeout(() => {
         if (resolved) return;
         resolved = true;
-        try { stream.close(); } catch {}
+        try { stream.close(); } catch { }
         reject(new Error("command_timeout"));
       }, timeoutMs);
       const finish = (error, exitCode) => {
@@ -934,7 +934,7 @@ async function runSshAudit(job) {
       meta: { ...meta, durationMs: Date.now() - started, error: error.message || "ssh_audit_error" },
     };
   } finally {
-    try { ssh.end(); } catch {}
+    try { ssh.end(); } catch { }
   }
 }
 
@@ -947,8 +947,6 @@ async function runSshConnectivityTest(job) {
   const username = credentials.username || target.username || SSH_DEFAULT_USERNAME;
   const privateKey = normalizePrivateKey(credentials.privateKey || credentials.key || process.env.AGENT_SSH_KEY);
   const passphrase = credentials.passphrase ? String(credentials.passphrase) : undefined;
-
-  console.log("[agent][debug] ssh_test privateKey snippet:", privateKey ? `${privateKey.slice(0, 64)}...` : "missing");
 
   if (!host || !privateKey) {
     return {
@@ -963,22 +961,58 @@ async function runSshConnectivityTest(job) {
 
   try {
     const ssh = await connectSshClient({ host, port, username, privateKey, passphrase });
-    try { ssh.end(); } catch {}
+    try { ssh.end(); } catch { }
     return {
       status: "completed",
       findings: [
         finding("ssh_test", "info", "Connexion SSH établie", { host, port, username },
           "La connexion SSH fonctionne avec ces identifiants."),
       ],
+      summary: {
+        type: "ssh_test",
+        success: true,
+        host,
+        port,
+        username,
+        durationMs: Date.now() - started,
+      },
       meta: { durationMs: Date.now() - started },
     };
   } catch (error) {
+    const norm = normalizeSshError(error);
+
+    // Log détaillé pour toi dans les logs de l’agent
+    console.error("[ssh_test] SSH connection error", {
+      host,
+      port,
+      username,
+      category: norm.category,
+      code: norm.code,
+      message: norm.rawMessage,
+    });
+
     return {
       status: "failed",
       findings: [
-        finding("ssh_test", "high", "Connexion SSH impossible", { host, port, username, error: error.message },
-          "Vérifiez l’utilisateur, la clé privée et l’accès réseau au port SSH."),
+        finding("ssh_test", "high", "Connexion SSH impossible", {
+          host, port, username,
+          errorCategory: norm.category,
+          errorCode: norm.code,
+          errorMessage: norm.rawMessage,
+        },
+          `${norm.userMessage} ${norm.suggestion}`),
       ],
+      summary: {
+        type: "ssh_test",
+        success: false,
+        host,
+        port,
+        username,
+        durationMs: Date.now() - started,
+        errorCategory: norm.category,
+        errorCode: norm.code,
+      },
+      error: norm.userMessage,
       meta: { durationMs: Date.now() - started, error: error.message || "ssh_test_error" },
     };
   }
@@ -1132,6 +1166,76 @@ function installSignalHandlers() {
   process.on("beforeExit", () => flushMetrics(true));
 }
 
+/**
+ * normalyse le message d'erreur
+ * @param {*} error 
+ * @returns 
+ */
+function normalizeSshError(error) {
+  const rawMessage = error?.message || String(error || "");
+  const code = error?.code || error?.errno || null;
+
+  if (/ECONNREFUSED/i.test(rawMessage) || code === "ECONNREFUSED") {
+    return {
+      category: "connection_refused",
+      userMessage: "Connexion refusée par l’hôte SSH.",
+      suggestion: "Vérifiez que le service SSH tourne et que le pare-feu autorise l’accès au port SSH.",
+      code,
+      rawMessage,
+    };
+  }
+
+  if (/ETIMEDOUT/i.test(rawMessage) || code === "ETIMEDOUT") {
+    return {
+      category: "timeout",
+      userMessage: "Délai d’attente dépassé lors de la connexion SSH.",
+      suggestion: "Vérifiez la connectivité réseau, l’IP, le port et l’ouverture du port depuis Internet.",
+      code,
+      rawMessage,
+    };
+  }
+
+  if (/ENOTFOUND|getaddrinfo/i.test(rawMessage)) {
+    return {
+      category: "dns_resolution_failed",
+      userMessage: "Impossible de résoudre le nom d’hôte.",
+      suggestion: "Vérifiez l’adresse IP ou le nom de domaine configuré pour ce scan.",
+      code,
+      rawMessage,
+    };
+  }
+
+  if (/Permission denied \(publickey\)/i.test(rawMessage)) {
+    return {
+      category: "auth_failed",
+      userMessage: "Authentification SSH refusée (clé publique non acceptée).",
+      suggestion: "Vérifiez l’utilisateur, la clé publique dans authorized_keys et les permissions du compte.",
+      code,
+      rawMessage,
+    };
+  }
+
+  if (/invalid format|not a valid private key|Unsupported key format/i.test(rawMessage)) {
+    return {
+      category: "key_invalid",
+      userMessage: "La clé privée fournie n’est pas valide ou dans un format supporté.",
+      suggestion: "Vérifiez le format de la clé et regénérez-la si besoin.",
+      code,
+      rawMessage,
+    };
+  }
+
+  return {
+    category: "unknown",
+    userMessage: "Erreur inconnue lors de la connexion SSH.",
+    suggestion: "Consultez les logs détaillés de l’agent pour plus d’informations.",
+    code,
+    rawMessage,
+  };
+}
+
+
+
 installSignalHandlers();
 
 // -----------------------------
@@ -1180,7 +1284,7 @@ async function checkAgentHealth() {
 // Main loop
 // -----------------------------
 async function main() {
-  console.log(`[agent] praesid-infra-agent started (agentId=${AGENT_ID})`);
+  console.log(`[agent] ------------------   praesid-infra-agent started (agentId=${AGENT_ID}) ----------------------`);
   console.log(`[agent] API base: ${PRAESID_API_BASE}`);
 
   while (true) {
