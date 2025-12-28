@@ -342,7 +342,80 @@ function buildSummary(findings, meta = {}) {
     backups,
   };
 
+  // SSH Audit enrichment: add structured data to runtime/exposure/backups
   if (meta.systemInfo || meta.packages || meta.services || meta.diskUsage) {
+    // Enrich runtime with SSH audit data
+    if (meta.systemInfo?.osRelease?.PRETTY_NAME) {
+      runtime.push({
+        label: "OS (SSH audit)",
+        value: meta.systemInfo.osRelease.PRETTY_NAME,
+        status: "ok",
+      });
+    } else if (meta.systemInfo?.kernel) {
+      runtime.push({
+        label: "Kernel",
+        value: meta.systemInfo.kernel.split('\n')[0],
+        status: "ok",
+      });
+    }
+
+    if (meta.packages?.length) {
+      runtime.push({
+        label: "Packages installés",
+        value: `${meta.packages.length} package(s) détecté(s)`,
+        status: "ok",
+      });
+    }
+
+    if (meta.services?.length) {
+      runtime.push({
+        label: "Services actifs",
+        value: `${meta.services.length} service(s) en cours`,
+        status: "ok",
+      });
+    }
+
+    // Enrich exposure with firewall/ports data
+    if (meta.firewall?.ufw) {
+      const ufwStatus = meta.firewall.ufw.toLowerCase().includes("inactive") ? "warn" : "ok";
+      exposure.push({
+        label: "Pare-feu UFW",
+        detail: meta.firewall.ufw.split('\n')[0] || meta.firewall.ufw,
+        status: ufwStatus,
+        statusLabel: ufwStatus === "warn" ? "Inactif" : "Actif",
+      });
+    }
+
+    if (meta.openPortsDetailed?.length) {
+      exposure.push({
+        label: "Ports ouverts (SSH audit)",
+        detail: `${meta.openPortsDetailed.length} port(s) en écoute`,
+        status: meta.openPortsDetailed.length > 10 ? "warn" : "ok",
+        statusLabel: meta.openPortsDetailed.length > 10 ? "À réduire" : "Normal",
+      });
+    }
+
+    // Enrich backups with disk usage
+    if (meta.diskUsage?.length) {
+      const criticalDisks = meta.diskUsage.filter((disk) => {
+        const pct = parseInt(String(disk.percent || "").replace("%", ""), 10);
+        return Number.isFinite(pct) && pct >= 90;
+      });
+
+      if (criticalDisks.length > 0) {
+        backups.status = "error";
+        backups.detail = `${criticalDisks.length} disque(s) plein(s) (>90%)`;
+      } else {
+        const maxUsage = Math.max(...meta.diskUsage.map(d => {
+          const pct = parseInt(String(d.percent || "").replace("%", ""), 10);
+          return Number.isFinite(pct) ? pct : 0;
+        }));
+        backups.status = maxUsage > 80 ? "warn" : "ok";
+        backups.detail = `Espace disque: ${maxUsage}% max utilisé`;
+      }
+    }
+
+    // Keep detailed SSH audit data
     summary.sshAudit = {
       systemInfo: meta.systemInfo || null,
       packages: meta.packages || [],
