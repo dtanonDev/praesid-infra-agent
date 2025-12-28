@@ -1299,10 +1299,8 @@ async function main() {
   while (true) {
     try {
       const res = await apiGet("/infra-scans/next");
-      console.log(`[agent] get new job available :  ${res}`);
 
       if (res.statusCode === 204) {
-        console.log(`[agent] no job available, sleeping ${POLL_MS}ms`);
         await sleep(POLL_MS);
         continue;
       }
